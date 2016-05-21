@@ -1,7 +1,45 @@
+#!/usr/local/bin/perl
+
+=pod
+
+=head1 DESCRIPTION
+
+This script was written to select variants for collapsing tests (MONSTER). The script allows to specify
+a custom set of criteria to define genomic regions of interest, scoring and weighting methods.
+
+In more details: the selection is perfomed in a gene basis: the user can specify which functional
+part of the gene is of interest (eg. exon, CDS stc). Besides the GENCODE elements, Ensembl regulatory
+features are also available to be selected: if a feature overlaps with the queried gene, or
+overlaps with with an eQTL signal which is linked to the gene.
+
+Overlapping variants from the 15X helic data are then selected using intersectbed. After applying
+a various set of filters, scores are assigned to the variants to use them as weights by the
+collapsing test. Optionally weigh can be adjusted for allele frequencies to add
+more weight to rare variants.
+
+=head1 VERSION
+
+v.1.3. Last modified: 2016.05.09 by Daniel Suveges, mail: ds26@sanger.ac.uk
+
+=head2 Changes
+
+=over 4
+
+=item * Built in vcf file removed - the source vcf changed too many times. Now vcf file has to be specified with a command line parameter using the --vcfFile or -x switch
+
+=item * Default weighting removed - if no weight specified there will be no weighting applied (previously Eigen scores were the default) Output changes accordingly.
+
+=item * If the normalized weight is equal to zero, it will be increased by 0.0001. Monster fails if 0 weight is given.
+
+=back
+
+=cut
+
 use strict;
 use warnings;
 use Data::Dumper; # used for diagnostic purposes.
 use Pod::Usage qw(pod2usage); # Used for providing useful error/warning and user messages.
+
 
 # GENCODE: gene, exon, transcript, CDS, UTR
 # GTEx: promoter, CTCF, enhancer, promoterFlank, openChrom, TF_bind, allreg
@@ -31,7 +69,6 @@ our $ga = $registry->get_adaptor( "human", "core", "gene" );
 
 # Files for each required dataset are hardcoded:
 our $geneBedFile      = '/lustre/scratch113/projects/helic/ds26/project_burden/Annotation_file/Annotations_GENCODE_GTEx_overlap.bed.gz';
-our $vcfFile          = '/lustre/scratch115/projects/t144_helic_15x/manolis-initial-385/15x_helic_manolis_initial_385_batch.vcf.gz';
 our $chainFile        = '/nfs/team144/ds26/projects/2016.03.21_Regulation_GTEx/hg38ToHg19.over.chain.gz';
 our $temporaryBedFile = '/nfs/team144/ds26/projects/2016.03.21_Regulation_GTEx/temporary_hits_GRCh38_%s.bed';
 our $liftoverPath     = '/nfs/users/nfs_d/ds26/bin/liftOver';
@@ -39,8 +76,8 @@ our $EigenPath        = '/lustre/scratch113/teams/zeggini/users/ds26/refseq/eige
 our $caddPath         = '/lustre/scratch114/resources/cadd_scores/20150729-v1.3/whole_genome_SNVs_inclAnno.tsv.gz';
 
 # All files must exist otherwise the scrip quits:
-foreach my $file ($geneBedFile, $vcfFile,  $chainFile, $liftoverPath, $EigenPath, $caddPath){
-    $file =~ s/\%s/chr12/;
+foreach my $sourcefile ($geneBedFile,  $chainFile, $liftoverPath, $EigenPath, $caddPath){
+    my $file = sprintf($sourcefile, "chr12");
     pod2usage({-verbose => 99, -message => "[Error] One of the requested file does not exits ($file). Exiting.\n", -sections => "FILES|SYNOPSIS" })unless ( -e $file);
 }
 
@@ -48,11 +85,13 @@ foreach my $file ($geneBedFile, $vcfFile,  $chainFile, $liftoverPath, $EigenPath
 use Getopt::Long qw(GetOptions);
 my ($inputFile, $outputFile, $GENCODE, $GTEx, $verbose, $overlap, $help,
     $extend, $minor, $tissue_list, $MAF, $MAC, $score, $MAF_weight, $k);
+our (vcfFile);
 
 GetOptions(
     # Input/Output:
     'input|i=s' => \$inputFile,
     'output|o=s' => \$outputFile,
+    'vcfFile|x=s' => \$vcfFile,
 
     # GENCODE features:
     "GENCODE|G=s" => \$GENCODE,
@@ -93,10 +132,9 @@ GetOptions(
 pod2usage({-verbose => 2}) if $help;
 pod2usage({-message => "[Error] Input file has to be specified with the -i switch!\n", -verbose => 0}) unless $inputFile;
 pod2usage({-message => "[Error] Output file prefix has to be specified with the -o switch!\n", -verbose => 0}) unless $outputFile;
-pod2usage({-message => "[Warning] Scoring method was not specified! Eigen scores are used.\n", -verbose => 0, -exitval => "NOEXIT"}) unless $score;
-pod2usage({-message => '[Warning] Minor allele frequency has to be between 0 and 1.\n', -exitval => "NOEXIT"}) unless $MAF > 0 and $MAF <= 1;
+pod2usage({-message => "[Error] The input vcf file has to be specified with the --vcfFile or the -x switch!\n", -verbose => 0}) unless ( -e $vcfFile );
 
-# Parsing comman line arguments:
+# Parsing command line arguments:
 our %GENCODE = %{&parseGENCODE($GENCODE)};
 our %GTEx = %{&parseRegulation($GTEx)};
 our %overlap = %{&parseRegulation($overlap)};
@@ -107,9 +145,10 @@ our %Variant = ('MAF' => $MAF || 0.05,
 $GENCODE{'minor'}  = 1 if $minor;
 $GENCODE{'extend'} = $extend || 0;
 
-# Assigning default value to the weighting constant:
+# Assigning default values:
 $k = 50 unless $k;
-$score = "Eigen" unless $score;
+$score = "NA" unless $score;
+
 pod2usage({-message => sprintf('[Warning] %s is not a supported scoring method. Either CADD, GERP or Eigen has to be specified.
 [Warning] The default Eigen method is used.\n', $score), -verbose => 0, -exitval => "NOEXIT"}) unless ( $score eq "GERP" or
                     $score eq "CADD" or $score eq "Eigen"); # The submitted scoring method might not be supported! Check for it now!
@@ -150,11 +189,14 @@ while (my $ID = <$INPUT>) {
     # Get CADD and GERP scores:
     $hash = &get_CADD_GERP($hash, $score) if $score eq "GERP" or $score eq "CADD";
 
+    # Scores have to be normalized to make sure all values will be between 0 and 1
+    $hash = &normalize_Score($hash) if $score ne "NA";
+
     # Weighting scores if requested:
-    $hash = &weight_score($hash, $k) if $MAF_weight;
+    $hash = &weight_score($hash, $k) if $MAF_weight and $score ne "NA";
 
     # Saving data into file:
-    &print_SNPlist($hash, $variant_output, $name);
+    &print_SNPlist($hash, $variant_output, $name, $score);
 
     # Diagnostic dumper of the hash:
     # print Dumper $hash;
@@ -163,6 +205,48 @@ while (my $ID = <$INPUT>) {
 # print "Genotypes:", Dumper ($genotypes);
 open(my $genotype_output, ">", $outputFile."_genotype") or die "[Error] Output file ($outputFile\_genotype) could not opened.\n";
 &print_genotypes($genotypes, $genotype_output);
+
+
+##
+## A function to normalize scores:
+##
+sub normalize_Score {
+    my %hash = %{$_[0]};
+
+    # print Dumper %hash;
+
+    # Looping through all variants:
+    my $NAs = 0;
+    my @scores = ();
+    foreach my $SNP (keys %hash){
+        push(@scores, $hash{$SNP}{score}) if $hash{$SNP}{score} ne "NA";
+        if ($hash{$SNP}{score} eq "NA"){
+            print STDERR "[Info] Missing values were found. Removing these SNPs.\n";
+            delete $hash{$SNP};
+        }
+    }
+    @scores = sort {$a <=> $b} @scores;
+    my $min = $scores[0] if @scores;
+    my $max = $scores[-1] if @scores;
+
+    # No normalization if there are only one value.
+    # No normalization if there are NA-s.
+    # In these cases all weights will be set to 1.
+    if (scalar(@scores) <= 1){
+        print STDERR "[Info] Only one SNP was found. No weights applied.\n";
+
+        foreach my $SNP (keys %hash){
+            $hash{$SNP}{score} = 1;
+        }
+    }
+    else {
+        foreach my $SNP (keys %hash){
+            $hash{$SNP}{score} = ($hash{$SNP}{score} - $min) / ($max - $min);
+        }
+    }
+
+    return \%hash;
+}
 
 ##
 ## Function to parsing input parameters
@@ -178,6 +262,7 @@ sub parseGENCODE {
 }
 sub parseRegulation {
     # Accepted features: promoter, CTCF, enhancer, promoterFlank, openChrom, TF_bind, allreg
+    return {} unless $_[0];
     my $regString = $_[0];
     my %hash = ();
     foreach my $feature (split(",", $regString)){
@@ -233,13 +318,23 @@ sub print_SNPlist {
     my %hash = %{$_[0]};
     my $outputhandle = $_[1];
     my $gene_name = $_[2];
+    my $score = $_[3];
 
-    #
-    print $outputhandle "$gene_name\t1\t", join("\t", keys %hash),"\n$gene_name\t0\t";
-    foreach my $snpid (keys %hash){
-        print  $outputhandle "$hash{$snpid}{score}\t"
+    # The flag will be 1 if we have score but 0 if we don't have score.
+    my $flag;
+    $score ne "NA" ? $flag = 1 : $flag = 0;
+
+    print $outputhandle "$gene_name\t$flag\t", join("\t", keys %hash), "\n";
+    my @scores = ();
+
+    # If cores are available, they will be saved also:
+    if ($flag) {
+        foreach my $snpid (keys %hash){
+            #print  $outputhandle "$hash{$snpid}{score}\t"
+            push (@scores, $hash{$snpid}{score});
+        }
+        print $outputhandle "$gene_name\t0\t", join("\t", @scores),"\n";
     }
-    print $outputhandle "\n";
 
     return 1;
 }
@@ -256,6 +351,7 @@ sub get_Eigen_Score {
         my $EigenFile = sprintf($EigenPath, $hash{$var}{GRCh37}[0]);
         (my $chr = $hash{$var}{GRCh37}[0] ) =~ s/chr//i;
         my $tabix_query = sprintf("tabix %s %s:%s-%s | grep %s", $EigenFile, $chr, $hash{$var}{GRCh37}[2], $hash{$var}{GRCh37}[2], $hash{$var}{alleles}[1]);
+        print "$tabix_query\n";
         my $lines = `bash -O extglob -c \'$tabix_query\'`;
         $hash{$var}{score} = "NA"; # Initialize Eigen score.
 
@@ -374,7 +470,7 @@ sub processVar {
         my $MAC = $ac;
         $MAC = $an - $ac if $MAC > $an / 2;
         if ($ac >= $Variant{'MAC'} && $MAF <= $Variant{'MAF'}){
-            my $SNPID = sprintf("%s:%s_%s/%s", $chr, $pos, $a1, $a2);
+            my $SNPID = sprintf("%s_%s_%s_%s", $chr, $pos, $a1, $a2);
 
             #Storing variant data for all variant:
             $hash{$SNPID}{"alleles"} = [$a1, $a2];
@@ -556,35 +652,17 @@ sub GetCoordinates {
     return ($chr, $start, $end, $stable_ID, $name)
 }
 
-
 ##
 ## Below is the documentation for the script:
 ##
+
 =pod
-
-=head1 DESCRIPTION
-
-This script was written to select variants for collapsing tests (MONSTER). The script allows to specify
-a custom set of criteria to define genomic regions of interest, scoring and weighting methods.
-
-In more details: the selection is perfomed in a gene basis: the user can specify which functional
-part of the gene is of interest (eg. exon, CDS stc). Besides the GENCODE elements, Ensembl regulatory
-features are also available to be selected: if a feature overlaps with the queried gene, or
-overlaps with with an eQTL signal which is linked to the gene.
-
-Overlapping variants from the 15X helic data are then selected using intersectbed. After applying
-a various set of filters, scores are assigned to the variants to use them as weights by the
-collapsing test. Optionally weigh can be adjusted for allele frequencies to add
-more weight to rare variants.
-
-=head1 VERSION
-
-v.1.0. Last modified: 2016.04.11 by Daniel Suveges, mail: ds26@sanger.ac.uk
 
 =head1 SYNOPSIS
 
 perl $0 --input|i <Input file>
         --output|o <Output file prefix>
+        --vcfFile|x <15X vcf file>
         --GENCODE|G <feature list>
         --GTEx|E <feature list>
         --overlap|L <featire list>
@@ -614,6 +692,14 @@ B<Output files:>
 
 Output prefix ${output}_genotype and ${output}_variants files are saved. Genotype and SNP files are suitable input for MONSTER (more information of the format: I<www.stat.uchicago.edu/~mcpeek/software/MONSTER/MONSTER_v1.2_doc.pdf>) Output prefix is a required parameter!
 
+
+=back
+
+B<Vcf file:>
+
+=over 4
+
+The 15X vcf file with genotypes. This is a required parameter. This is the file from which the script extracts variants to generate SNP and genotype files.
 
 =back
 
